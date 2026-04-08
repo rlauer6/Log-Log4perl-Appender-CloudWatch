@@ -1,0 +1,545 @@
+##################################################
+package Log::Log4perl::Appender::CloudWatch;
+##################################################
+
+use warnings;
+use strict;
+
+use Amazon::API::CloudWatchLogs;
+use Carp;
+use Data::Dumper;
+use English qw(-no_match_vars);
+use Digest::MD5 qw(md5_hex);
+use Data::UUID;
+use Scalar::Util qw( reftype );
+
+use constant { ## no critic (ValuesAndExpressions::ProhibitConstantPragma)
+  BUFFER_SIZE             => 1_000,
+  MAX_RETRIES             => 5,
+  RETRY_DELAY             => 1,
+  SLASH                   => q{/},
+  EMPTY                   => q{},
+  TRUE                    => 1,
+  FALSE                   => 0,
+  MILLISECONDS_PER_SECOND => 1_000,
+  HTTP_OK                 => 200,
+  HTTP_BAD_REQUEST        => 400,
+};
+
+our $VERSION = '@PACKAGE_VERSION@';
+
+__PACKAGE__->follow_best_practice;
+__PACKAGE__->mk_accessors(
+  qw(
+    buffer_size
+    cwl
+    endpoint_url
+    event_count
+    events
+    group
+    group_mode
+    max_retries
+    retry_delay
+    stream
+    stream_mode
+  )
+);
+
+use parent qw( Log::Log4perl::Appender Class::Accessor::Fast);
+
+##################################################
+sub new {
+##################################################
+  my ( $class, %options ) = @_;
+
+  my $self = bless \%options, $class;
+
+  $self->init_buffer;
+
+  $self->init_endpoint_url;
+
+  $self->init_cloudwatch_logs;
+
+  croak 'no group [' . $self->get_group . '] exists.'
+    if !$self->check_group;
+
+  croak 'no stream [' . $self->get_stream . '] exists.'
+    if !$self->check_stream;
+
+  $self->set_buffer_size( $self->get_buffer_size || BUFFER_SIZE );
+
+  $self->set_max_retries( $self->get_max_retries || MAX_RETRIES );
+
+  $self->set_retry_delay( $self->get_retry_delay || RETRY_DELAY );
+
+  return $self;
+}
+
+##################################################
+sub log { ## no critic (Subroutines::ProhibitBuiltinHomonyms)
+##################################################
+  my ( $self, %params ) = @_;
+
+  my $events = $self->get_events || $self->init_buffer;
+
+  push @{$events},
+    {
+    message   => $params{message},
+    timestamp => time * MILLISECONDS_PER_SECOND,
+    };
+
+  $self->set_event_count( $self->get_event_count + 1 );
+
+  if ( $self->get_event_count >= $self->get_buffer_size ) {
+    $self->flush_buffer;
+  }
+
+  return TRUE;
+}
+
+##################################################
+sub init_endpoint_url {
+##################################################
+  my ($self) = @_;
+
+  my $endpoint_url = $ENV{AWS_ENDPOINT_URL} || $self->get_endpoint_url;
+
+  return $self->set_endpoint_url($endpoint_url);
+}
+
+##################################################
+sub init_cloudwatch_logs {
+##################################################
+  my ($self) = @_;
+
+  if ( !$self->get_cwl ) {
+    $self->set_cwl(
+      Amazon::API::CloudWatchLogs->new(
+        print_error => TRUE,
+        url         => $self->get_endpoint_url,
+        no_logger   => TRUE,
+      )
+    );
+  }
+
+  return $self->get_cwl;
+}
+
+##################################################
+sub check_stream {
+##################################################
+  my ($self) = @_;
+
+  if ( ref $self->get_stream ) {
+    $self->set_stream_mode( $self->get_stream->{mode} || 'create' );
+    $self->set_stream( $self->get_stream->{name} );
+  }
+  else {
+    # default mode = 'create'
+    $self->set_stream_mode('create');
+  }
+
+  my $stream_exists;
+
+  if ( $self->get_stream_mode eq 'create' ) {
+    $stream_exists = $self->create_log_stream;
+  }
+  elsif ( $self->get_stream_mode eq 'append' ) {
+    $stream_exists = $self->stream_exists;
+  }
+
+  return $stream_exists;
+}
+
+##################################################
+sub check_group {
+##################################################
+  my ($self) = @_;
+
+  croak 'no group'
+    if !$self->get_group;
+
+  if ( ref $self->get_group ) {
+    $self->set_group_mode( $self->get_group->{mode} || 'no' );
+    $self->set_group( $self->get_group->{name} );
+  }
+  else {
+    $self->set_group_mode('no');
+  }
+
+  return TRUE
+    if $self->group_exists;
+
+  # create if the group does not exist?
+  return $self->get_group_mode eq 'create' ? $self->create_log_group : FALSE;
+}
+
+##################################################
+sub create_log_group {
+##################################################
+  my ($self) = @_;
+
+  my $group = $self->get_group;
+  my $cwl   = $self->get_cwl;
+
+  $cwl->CreateLogGroup( { logGroupName => $group } );
+
+  return $cwl->get_response->code eq HTTP_OK ? TRUE : FALSE;
+}
+
+##################################################
+sub describe_group {
+##################################################
+  my ($self) = @_;
+
+  my $group_description;
+
+  my $cwl   = $self->get_cwl;
+  my $group = $self->get_group;
+
+  my $rsp = $cwl->DescribeLogGroups( { logGroupNamePrefix => $group } );
+
+  if ( $rsp->{logGroups} && reftype( $rsp->{logGroups} ) eq 'ARRAY' ) {
+    my %groups = map { ( $_->{logGroupName}, $_ ) } @{ $rsp->{logGroups} };
+    $group_description = $groups{$group};
+  }
+
+  return $group_description || {};
+}
+
+##################################################
+sub group_exists {
+##################################################
+  my ($self) = @_;
+
+  my $cwl   = $self->get_cwl;
+  my $group = $self->get_group;
+
+  my $rsp = $cwl->DescribeLogGroups( { logGroupNamePrefix => $group } );
+
+  return @{ $rsp->{logGroups} } ? TRUE : FALSE;
+}
+
+##################################################
+sub describe_stream {
+##################################################
+  my ($self) = @_;
+
+  my $group  = $self->get_group;
+  my $stream = $self->get_stream;
+
+  my $rsp = $self->get_cwl->DescribeLogStreams(
+    { logGroupName        => $group,
+      logStreamNamePrefix => $stream,
+    },
+  );
+
+  my $stream_description;
+
+  if ( $rsp->{logStreams} && reftype( $rsp->{logStreams} ) eq 'ARRAY' ) {
+    my %streams
+      = map { ( $_->{logStreamName}, $_ ) } @{ $rsp->{logStreams} };
+
+    $stream_description = $streams{$stream};
+  }
+
+  return $stream_description || {};
+}
+
+##################################################
+sub stream_exists {
+##################################################
+  my ($self) = @_;
+
+  my $group  = $self->get_group;
+  my $stream = $self->get_stream;
+
+  my $rsp = $self->get_cwl->DescribeLogStreams(
+    { logGroupName        => $group,
+      logStreamNamePrefix => $stream,
+    },
+  );
+
+  return @{ $rsp->{logStreams} } ? TRUE : FALSE;
+}
+
+##################################################
+sub create_log_stream {
+##################################################
+  my ($self) = @_;
+
+  my $cwl = $self->get_cwl;
+
+  my $ug   = Data::UUID->new;
+  my $uuid = $ug->create;
+
+  my $stream_suffix = md5_hex( $ug->to_string($uuid) );
+  my $stream_prefix = $self->get_stream;
+
+  my $group = $self->get_group;
+
+  # create stream name consisting of the group name/stream name/unique-id
+  if ( !$stream_prefix ) {
+    $stream_prefix = substr( $group, 0, 1 ) eq SLASH ? substr( $group, 1 ) : $group;
+  }
+
+  $self->set_stream( $stream_prefix . SLASH . $stream_suffix );
+
+  $cwl->CreateLogStream(
+    { logGroupName  => $group,
+      logStreamName => $self->get_stream,
+    },
+  );
+
+  my $http_code = $cwl->get_response->code;
+
+  if ( $http_code ne HTTP_OK ) {
+    $self->set_stream(EMPTY);
+  }
+
+  return $self->get_stream ? TRUE : FALSE;
+}
+
+##################################################
+sub init_buffer {
+##################################################
+  my ($self) = @_;
+
+  $self->set_events( [] );
+  $self->set_event_count(0);
+
+  return $self->get_events;
+}
+
+##################################################
+sub flush_buffer {
+##################################################
+  my ($self) = @_;
+
+  my $cwl    = $self->get_cwl;
+  my $group  = $self->get_group;
+  my $stream = $self->get_stream;
+
+  my $events      = $self->get_events;
+  my $event_count = $self->get_event_count;
+
+  return $event_count
+    if !$event_count;
+
+  if ( $cwl->get_credentials->is_token_expired ) {
+    $cwl->get_credentials->refresh_token;
+  }
+
+  my $retries = $self->get_max_retries;
+
+  while ( $retries-- ) {
+    my $rsp = eval { $cwl->PutLogEvents( { logEvents => $events, logGroupName => $group, logStreamName => $stream, }, ); };
+
+    last if !$EVAL_ERROR;
+
+    if ( ref($EVAL_ERROR) =~ /Amazon::API::Error/xsm ) {
+      my $error_rsp = $EVAL_ERROR->get_response;
+      warn $cwl->print_error;
+    }
+    else {
+      croak $EVAL_ERROR;
+    }
+
+    sleep $self->get_retry_delay;
+  }
+
+  $self->init_buffer;
+
+  return $event_count;
+}
+
+##################################################
+sub DESTROY {
+##################################################
+  my ($self) = @_;
+
+  return $self->flush_buffer;
+}
+
+1;
+
+__END__
+
+=pod
+
+=head1 NAME
+
+Log::Log4perl::Appender::CloudWatch - Appender to send logs to CloudWatch
+
+=head1 SYNOPSIS
+
+ use Log::Log4perl;
+
+ my $log4perl_conf =<<'END_OF_TEXT';
+ log4perl.rootLogger=DEBUG, CLOUDWATCH
+ log4perl.appender.CLOUDWATCH=Log::Log4perl::Appender::CloudWatch
+ log4perl.appender.CLOUDWATCH.group=/test-log-group
+ log4perl.appender.CLOUDWATCH.stream=stream-prefix
+ log4perl.appender.CLOUDWATCH.buffer_size=1
+ log4perl.appender.CLOUDWATCH.layout=PatternLayout
+ log4perl.appender.CLOUDWATCH.layout.ConversionPattern=%d [%r] %F %L %c - %m
+ END_OF_TEXT
+
+ Log::Log4perl::init(\$log4perl_conf);
+
+ my $logger = Log::Log4perl->get_logger('');
+
+=head1 DESCRIPTION
+
+Appender to send logs to AWS CloudWatch. Events are buffered and sent
+when the buffer is full or when the appender is destroyed.
+
+=head1 DEPENDENCIES
+
+ Amazon::API
+ Amazon::Credentials
+ Data::UUID
+ Digest::MD5
+
+...and possibly others
+
+=head1 CONFIGURATION
+
+The appender supports several configuration attributes for logging to
+CloudWatch described below.
+
+Example Log::Log4perl configuration:
+
+ ############################################################
+ # A simple root logger with a Log::Log4perl::Appender::CloudWatch 
+ ############################################################
+ log4perl.rootLogger=DEBUG, CLOUDWATCH
+
+ log4perl.appender.CLOUDWATCH=Log::Log4perl::Appender::CloudWatch
+ log4perl.appender.CLOUDWATCH.group=/test-log-group
+ log4perl.appender.CLOUDWATCH.stream=foobar
+
+ log4perl.appender.CLOUDWATCH.layout=PatternLayout
+ log4perl.appender.CLOUDWATCH.layout.ConversionPattern=%d [%r] %F %L %c - %m
+
+=head2 Options
+
+=over 4
+
+=item group (required)
+
+=over 10
+
+=item name
+
+Name of the log group where log streams will be written
+
+=item mode
+
+Determines if the log group should be created if it does not exist.
+
+valid values: create
+
+I<Note: You can use the dot notation or just set C<group> to the group name.>
+
+ log4perl.appender.CLOUDWATCH=Log::Log4perl::Appender::CloudWatch
+ log4perl.appender.CLOUDWATCH.group.name=/ecs/myapp
+ log4perl.appender.CLOUDWATCH.stream.name=ecs/myapp/2026-04-06
+ log4perl.appender.CLOUDWATCH.stream.mode=create
+
+=back
+
+=item stream (optional)
+
+=over 10
+
+=item name
+
+Name of the stream. The name of the stream is used as a prefix unless
+the C<mode> option is set to 'append'.  If no stream name is given,
+then a unique stream name will be created composed of the log group
+name and a unique suffix.
+
+=item mode
+
+If mode is set to 'append' the appender will append logs to the
+group/stream provided.  If no mode is provided or the mode is set to
+'create' then a new stream will be created. The appender will use the
+stream name as a prefix with a suffix consisting of the MD5 hash of a
+UUID in order to create a unique stream name.
+
+Example:
+
+ log4perl.appender.CLOUDWATCH=Log::Log4perl::Appender::CloudWatch
+ log4perl.appender.CLOUDWATCH.group=/ecs/myapp
+ log4perl.appender.CLOUDWATCH.stream=
+
+ stream name = ecs/myapp/f974195a83b143a68672b62457a313ca
+
+valid values: append|create
+
+I<Note: You can use the dot notation or just set C<stream> to the stream name.>
+
+ log4perl.appender.CLOUDWATCH=Log::Log4perl::Appender::CloudWatch
+ log4perl.appender.CLOUDWATCH.group.name=/ecs/myapp
+ log4perl.appender.CLOUDWATCH.stream.name=ecs/myapp/2026-04-06
+ log4perl.appender.CLOUDWATCH.stream.mode=create
+
+=back
+
+=item buffer_size
+
+The number of events to buffer before sending the events to
+CloudWatch. The maximum number of events that can sent in one payload
+is 10K. The maximum size of the payload is 1,048,576 bytes.
+
+default: 1000
+
+See
+L<https://docs.aws.amazon.com/AmazonCloudWatchLogs/latest/APIReference/API_PutLogEvents.html>
+for more details.
+
+=item max_retries
+
+The number of times to retry the PutLogEvents operation if an
+C<Amazon::API::Error> exception is thrown.
+
+default: 5
+
+=item retry_delay
+
+The amount of time (in seconds) to wait before retrying the
+PutLogEvents operation.
+
+default: 1
+
+=item endpoint_url
+
+The API endpoint - leave blank for AWS, http://localhost:4566 for
+LocalStack (or where you have installed LocalStack).
+
+=back
+
+=head1 CAVEATS
+
+The appender internally uses a null logger to prevent re-entrant
+logging calls. Any debugging of the CloudWatch API calls made
+internally by the appender should be done outside the context of
+this appender - for example, in a standalone test script that
+invokes C<Amazon::API::CloudWatchLogs> directly rather than through
+Log::Log4perl configuration.
+
+=head1 SEE ALSO
+
+L<Amazon::API::CloudWatchLogs>, L<Amazon::Credentials>, L<Amazon::API>
+
+=head1 AUTHOR
+
+Rob Lauer - E<lt>rlauer6@comcast.netE<gt>
+
+=head1 LICENSE
+
+This library is free software; you can redistribute it and/or modify it
+under the same terms as Perl itself.
+
+=cut

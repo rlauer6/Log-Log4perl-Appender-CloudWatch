@@ -1,0 +1,11 @@
+Amazon::API::CloudWatchLogs 2.1.13
+CLI::Simple 1.0.11
+CLI::Simple::Constants 1.0.11
+Class::Accessor::Fast 0.51
+Data::UUID 1.227
+Date::Format 2.24
+JSON::PP 4.16
+Log::Log4perl::Appender 0
+Number::Bytes::Human 0.11
+Readonly 2.05
+Text::ASCIITable 0.22

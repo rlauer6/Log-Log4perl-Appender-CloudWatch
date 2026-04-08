@@ -1,0 +1,651 @@
+package Amazon::CloudWatchLogs;
+
+use strict;
+use warnings;
+
+use Amazon::API::CloudWatchLogs;
+use Carp;
+use Data::Dumper;
+use Data::UUID;
+use Date::Format;
+use Digest::MD5 qw( md5_hex );
+use English qw( -no_match_vars );
+use JSON::PP;
+use Number::Bytes::Human qw( format_bytes );
+use Text::ASCIITable;
+use Term::ANSIColor;
+use CLI::Simple::Constants qw(:chars :booleans);
+use Time::HiRes;
+
+use Readonly;
+
+# http response codes
+Readonly my $HTTP_BAD_REQUEST => 400;
+Readonly my $HTTP_OK          => 200;
+
+# defaults & magic values
+Readonly my $EVENT_BUFFER_SIZE   => 1000;
+Readonly my $GROUP_COLOR         => q{green};
+Readonly my $STREAM_COLOR        => q{magenta};
+Readonly my $IDLE_THRESHOLD      => 10;
+Readonly my $ISO_8601_FORMAT     => q{%Y-%m-%dT%H:%M:%SZ};
+Readonly my $ITER_LIMIT          => 50;
+Readonly my $LOCALSTACK_ENDPOINT => q{http://localhost:4566};
+Readonly my $LOG_DELAY           => 1;
+Readonly my $MAX_ENTRIES         => 1;
+Readonly my $MAX_RETRIES         => 100;
+Readonly my $MESSAGE_FORMAT      => q{%s - %s};
+Readonly my $RANDOM_SEED         => 0xffffff;
+Readonly my $TIME_ZONE           => q{GMT};
+
+# time
+Readonly my $MILLISECONDS_PER_SECOND => 1000;
+Readonly my $SECONDS_IN_MINUTE       => 60;
+Readonly my $MINUTES_IN_HOUR         => 60;
+Readonly my $HOURS_IN_DAY            => 24;
+Readonly my $SECONDS_IN_HOUR         => $SECONDS_IN_MINUTE * $MINUTES_IN_HOUR;
+Readonly my $SECONDS_IN_DAY          => $SECONDS_IN_HOUR * $HOURS_IN_DAY;
+
+our $VERSION = '@PACKAGE_VERSION@';
+
+use parent qw(CLI::Simple);
+
+caller or __PACKAGE__->main;
+
+#########################################################################
+sub cmd_delete_group {
+#########################################################################
+  my ($self) = @_;
+
+  my $cwl = $self->get_cwl;
+
+  my $group_name = $self->get_group;
+
+  croak 'no group'
+    if !$group_name;
+
+  $cwl->set_print_error($FALSE);
+  $cwl->set_raise_error($TRUE);
+
+  my $rsp = eval { return $cwl->DeleteLogGroup( { logGroupName => $group_name } ); };
+
+  if ($EVAL_ERROR) {
+    if ( $cwl->get_response->code eq $HTTP_OK ) {
+      printf "%s deleted.\n", $group_name;
+    }
+    elsif ( $cwl->get_response->code eq $HTTP_BAD_REQUEST ) {
+      print $cwl->print_error;
+    }
+    else {
+      print $EVAL_ERROR;
+    }
+  }
+
+  return $TRUE;
+}
+
+#########################################################################
+sub cmd_create_group {
+#########################################################################
+  my ($self) = @_;
+
+  my $cwl = $self->get_cwl;
+
+  my $group_name = $self->get_group;
+
+  croak 'no group'
+    if !$group_name;
+
+  $cwl->set_raise_error($FALSE);
+  $cwl->set_print_error($TRUE);
+
+  $cwl->CreateLogGroup( { logGroupName => $group_name } );
+
+  if ( $cwl->get_response->code eq $HTTP_OK ) {
+    printf "%s\n", $group_name;
+  }
+
+  return $TRUE;
+}
+
+#########################################################################
+sub _create_stream {
+#########################################################################
+  my ($self) = @_;
+
+  my $group  = $self->get_group;
+  my $stream = $self->get_stream;
+
+  croak 'no group'
+    if !$group;
+
+  croak 'no stream'
+    if !$stream;
+
+  my $cwl = $self->get_cwl;
+
+  $cwl->set_raise_error($FALSE);
+  $cwl->set_print_error($TRUE);
+
+  my $ug   = Data::UUID->new;
+  my $uuid = $ug->create;
+
+  my $stream_suffix = md5_hex( $ug->to_string($uuid) );
+  my $stream_prefix = $stream;
+
+  # create stream name consisting of the group name/stream name/unique-id
+  if ( !$stream_prefix ) {
+    $stream_prefix = substr( $group, 0, 1 ) eq $SLASH ? substr( $group, 1 ) : $group;
+  }
+
+  my $stream_name = $stream_prefix . $SLASH . $stream_suffix;
+
+  $cwl->CreateLogStream(
+    { logGroupName  => $group,
+      logStreamName => $stream_name,
+    },
+  );
+
+  return $cwl->get_response->code eq $HTTP_OK ? ( $group, $stream_name ) : ();
+}
+
+#########################################################################
+sub cmd_create_stream {
+#########################################################################
+  my ($self) = @_;
+
+  my $cwl = $self->get_cwl;
+
+  my ( $group, $stream ) = $self->_create_stream;
+
+  if ( $group && $stream ) {
+    print "$group $stream\n";
+  }
+
+  return $TRUE;
+}
+
+#########################################################################
+sub cmd_list_groups {
+#########################################################################
+  my ($self) = @_;
+
+  my $cwl = $self->get_cwl;
+
+  my $rsp = $cwl->DescribeLogGroups->{logGroups};
+
+  my %log_groups = map { ( $_->{logGroupName}, $_ ) } @{$rsp};
+
+  my $t = Text::ASCIITable->new(
+    { headingText => 'Log Groups',
+      allowANSI   => $TRUE,
+    },
+  );
+
+  $t->setCols( 'Group Name', 'Size', 'Creation Date' );
+
+  foreach my $g ( sort keys %log_groups ) {
+
+    my ( $bytes, $creation_time ) = @{ $log_groups{$g} }{qw(storedBytes creationTime)};
+
+    $bytes = $bytes ? format_bytes($bytes) : $EMPTY;
+
+    $t->addRow( $g, $bytes, fmt_time($creation_time) );
+  }
+
+  print $t;
+
+  return $TRUE;
+}
+
+#########################################################################
+sub cmd_get_stream {
+#########################################################################
+  my ($self) = @_;
+
+  my $cwl = $self->get_cwl;
+
+  my $group = $self->get_group;
+
+  croak 'no group'
+    if !$group;
+
+  my $stream_list = $self->fetch_streams;
+
+  croak 'no stream'
+    if !$stream_list && !$self->get_follow;
+
+  my $start_time = $self->get_start_time * $MILLISECONDS_PER_SECOND;
+
+  my %stream_tokens = map { $_ => $EMPTY } keys %{ $stream_list // {} };
+
+  my $idle_count = 0;
+
+  if ( $self->get_follow ) {
+    $SIG{INT} = sub { exit 1 };
+  }
+
+  FOLLOW: while ($TRUE) {
+
+    my $got_events = 0;
+
+    foreach my $stream_name ( keys %stream_tokens ) {
+      my $rsp = $cwl->GetLogEvents(
+        { logGroupName  => $group,
+          logStreamName => $stream_name,
+          startTime     => $start_time,
+          $stream_tokens{$stream_name} ? ( nextToken => $stream_tokens{$stream_name} ) : (),
+        }
+      );
+
+      if ( $rsp->{events} && @{ $rsp->{events} } ) {
+        $got_events = 1;
+        $idle_count = 0;
+
+        my ( $colored_group, $colored_stream ) = ( $group, $stream_name );
+
+        if ( my $color = $self->get_color ) {
+          $colored_group  = colored( $colored_group,  $GROUP_COLOR );
+          $colored_stream = colored( $colored_stream, $STREAM_COLOR );
+        }
+
+        my @prefix;
+
+        push @prefix, $self->get_no_group_name  ? () : $colored_group;
+        push @prefix, $self->get_no_stream_name ? () : $colored_stream;
+
+        push @prefix, @prefix ? $EMPTY : ();
+
+        my $message_prfx = join $SPACE, @prefix;
+
+        foreach my $e ( @{ $rsp->{events} } ) {
+          my ( $message, $timestamp ) = @{$e}{qw( message timestamp )};
+          chomp $message;
+          printf "%s[%s] %s\n", $message_prfx, fmt_time($timestamp), $message;
+        }
+      }
+
+      $stream_tokens{$stream_name} = $rsp->{nextForwardToken};
+    }
+
+    last if !$self->get_follow && !$got_events;
+
+    if ( !$got_events && $self->get_follow ) {
+      Time::HiRes::sleep( $self->get_sleep_time );
+      $idle_count++;
+
+      if ( $idle_count >= $self->get_idle_threshold ) {
+        my $stream_list = $self->fetch_streams;
+
+        foreach ( keys %{$stream_list} ) {
+          next if exists $stream_tokens{$_};
+          $stream_tokens{$_} = $EMPTY;
+        }
+
+        $idle_count = 0;
+      }
+    }
+  }
+
+  return $SUCCESS;
+}
+
+#########################################################################
+sub cmd_list_streams {
+#########################################################################
+  my ($self) = @_;
+
+  my $cwl = $self->get_cwl;
+
+  my $group = $self->get_group;
+
+  croak 'no group'
+    if !$group;
+
+  my $log_streams = $self->fetch_streams;
+
+  croak 'no streams'
+    if !$log_streams;
+
+  my $t = Text::ASCIITable->new(
+    { headingText => sprintf( 'Log Streams (%s)', $group ),
+      allowANSI   => $TRUE,
+    },
+  );
+
+  $t->setCols( 'Stream Name', 'Size', 'Creation Date', 'Last Event' );
+
+  my @sorted_list = sort { $a->{lastEventTimestamp} <=> $b->{lastEventTimestamp} } values %{$log_streams};
+
+  foreach my $s (@sorted_list) {
+
+    my ( $bytes, $creation_time, $last_event ) = @{$s}{qw(storedBytes creationTime lastEventTimestamp)};
+
+    $bytes = $bytes ? format_bytes($bytes) : $EMPTY;
+
+    $creation_time = fmt_time($creation_time);
+
+    $last_event = $last_event ? fmt_time($last_event) : $EMPTY;
+
+    $t->addRow( $s->{logStreamName}, $bytes, $creation_time, $last_event );
+  }
+
+  print $t;
+
+  return $TRUE;
+}
+
+#########################################################################
+sub init {
+#########################################################################
+  my ($self) = @_;
+
+  # -- log message formatting
+  if ( $self->get_localstack ) {
+    $self->set_endpoint_url($LOCALSTACK_ENDPOINT);
+  }
+
+  # -- start-time
+  if ( my $start_time = $self->get_start_time ) {
+    $self->set_start_time( parse_start_time($start_time) );
+  }
+
+  $self->set_idle_threshold( $self->get_idle_threshold // $IDLE_THRESHOLD );
+  $self->set_sleep_time( $self->get_sleep_time         // $LOG_DELAY );
+
+  $self->set_cwl(
+    Amazon::API::CloudWatchLogs->new(
+      debug       => $ENV{DEBUG} || $self->get_debug,
+      print_error => $TRUE,
+      url         => $self->get_endpoint_url,
+      region      => $self->get_region,
+      profile     => $self->get_profile,
+    )
+  );
+
+  return;
+}
+#########################################################################
+sub fmt_time {
+#########################################################################
+  my ( $time, $seconds ) = @_;
+
+  if ( !$time ) {
+    $time    = time;
+    $seconds = $TRUE;
+  }
+
+  $time = $seconds ? $time : $time / $MILLISECONDS_PER_SECOND;
+
+  return time2str( $ISO_8601_FORMAT, $time, $TIME_ZONE );
+}
+
+#########################################################################
+sub fmt_message {
+#########################################################################
+  my ( $time, $message, ) = @_;
+
+  return sprintf $MESSAGE_FORMAT, $time, $message;
+}
+
+#########################################################################
+sub parse_start_time {
+#########################################################################
+  my ($start_time) = @_;
+
+  eval { require Date::Manip; };
+
+  return _parse_start_time($start_time)
+    if $EVAL_ERROR;
+
+  my $date = Date::Manip::ParseDate($start_time)
+    or croak "invalid start time: $start_time";
+
+  return Date::Manip::UnixDate( $date, '%s' );
+}
+
+#########################################################################
+sub _parse_start_time {
+#########################################################################
+  my ($start_time) = @_;
+
+  my $seconds;
+
+  if ( $start_time =~ /\A(\d+)d\z/xsmi ) {
+    $seconds = $1 * $SECONDS_IN_DAY;
+  }
+  elsif ( $start_time =~ /\A(\d+)h\z/xsmi ) {
+    $seconds = $1 * $SECONDS_IN_HOUR;
+  }
+  elsif ( $start_time =~ /\A(\d+)m\z/xsmi ) {
+    $seconds = $1 * $SECONDS_IN_MINUTE;
+  }
+  else {
+    croak 'invalid start time, must be N(d|h|m)';
+  }
+
+  return time - $seconds;
+}
+
+#########################################################################
+sub fetch_streams {
+#########################################################################
+  my ($self) = @_;
+
+  my $cwl = $self->get_cwl;
+
+  my @streams;
+
+  my $next_token = $EMPTY;
+
+  my $limit = $self->get_limit;
+
+  my $start_time = $self->get_start_time * $MILLISECONDS_PER_SECOND;
+
+  my $logstream_prefix = $self->get_stream;
+  $cwl->set_use_paginator(0);
+
+  LOOP: while ($TRUE) {
+    my $rsp = $cwl->DescribeLogStreams(
+      { logGroupName => $self->get_group,
+        limit        => $limit // $ITER_LIMIT,
+        orderBy      => 'LastEventTime',
+        descending   => JSON::PP::true,
+        $next_token ? ( nextToken => $next_token ) : (),
+      },
+    );
+
+    my @log_streams = map { exists $_->{lastEventTimestamp} ? $_ : () } @{ $rsp->{logStreams} };
+
+    my @sorted_streams = reverse sort { $a->{lastIngestionTime} cmp $b->{lastIngestionTime} } @log_streams;
+
+    foreach my $s (@sorted_streams) {
+
+      my $stream_name = $s->{logStreamName};
+      next if $logstream_prefix && $stream_name !~ /^\Q$logstream_prefix\E/ixsm;
+
+      last LOOP if $start_time && $s->{lastIngestionTime} < $start_time;
+
+      push @streams, $s;
+    }
+
+    $next_token = $rsp->{nextToken};
+
+    last if !$next_token;
+
+    last if $limit && $limit <= @streams;
+  }
+
+  my %log_streams = map { ( $_->{logStreamName}, $_ ) } @streams;
+
+  return keys %log_streams ? \%log_streams : undef;
+}
+
+#########################################################################
+sub cmd_last_stream {
+#########################################################################
+  my ($self) = @_;
+
+  my $cwl = $self->get_cwl;
+
+  my $limit = $self->get_limit;
+  $self->set_limit(1);
+
+  my $last_stream = $self->fetch_streams();
+
+  if ($last_stream) {
+    print JSON::PP->new->pretty->encode( values %{$last_stream} );
+  }
+
+  $self->set_limit($limit);
+
+  return $TRUE;
+}
+
+#########################################################################
+sub main {
+#########################################################################
+
+  my %commands = (
+    'create-group'  => \&cmd_create_group,
+    'create-stream' => \&cmd_create_stream,
+    'delete-group'  => \&cmd_delete_group,
+    'get-stream'    => \&cmd_get_stream,
+    'last-stream'   => \&cmd_last_stream,
+    'list-groups'   => \&cmd_list_groups,
+    'list-streams'  => \&cmd_list_streams,
+  );
+
+  my @option_specs = qw(
+    append|a
+    color|c!
+    debug|d
+    endpoint-url=s
+    follow|f
+    format-messages!
+    group|g=s
+    help|h
+    idle-threshold|i=i
+    localstack|l
+    limit|L=i
+    no-group-name|G
+    no-stream-name|S!
+    profile|p=s
+    region|r=s
+    sleep-time=i
+    start-time|t=s
+    stream|s=s
+  );
+
+  my %defaults = (
+    color           => $TRUE,
+    no_group_name   => $FALSE,
+    no_stream_name  => $FALSE,
+    endpoint_url    => $ENV{AWS_ENDPOINT_URL},
+    format_messages => $TRUE,
+    region          => $ENV{AWS_REGION} || $ENV{AWS_DEFAULT_REGION},
+    profile         => $ENV{AWS_PROFILE} // 'default',
+    start_time      => 0,
+  );
+
+  my $cli = Amazon::CloudWatchLogs->new(
+    commands        => \%commands,
+    default_options => \%defaults,
+    option_specs    => \@option_specs,
+    extra_options   => [qw(cwl)],
+  );
+
+  return $cli->run;
+}
+
+1;
+
+__END__
+
+=pod
+
+=head1 NAME
+
+Amazon::CloudWatchLogs - CLI tool for interacting with AWS CloudWatch Logs
+
+=head1 SYNOPSIS
+
+ aws-logs [options] command
+
+=head1 DESCRIPTION
+
+C<Amazon::CloudWatchLogs> provides a command-line interface for common
+AWS CloudWatch Logs operations including listing log groups and streams,
+retrieving log events, and creating or deleting groups and streams.
+
+=head1 USAGE
+
+ aws-logs options command
+
+=head2 Commands
+
+  create-group    Create a new log group
+  create-stream   Create a new log stream
+  delete-group    Delete a log group
+  get-stream      Retrieves log stream events. Use with C<--follow> to tail streams continuously
+  last-stream     Displays name of last log stream with a given prefix
+  list-groups     List all log groups
+  list-streams    List all log streams for a group
+  help
+
+=head2 Options
+
+  --color, -c           display output in color (--no-color to disable)
+  --debug, -d           verbose debug output
+  --endpoint-url, -u    endpoint-url
+  --follow, -f          waits for new events and discovers new streams
+  --group, -g           log group name
+  --help, -h            help
+  --idle-threshold      number of times no events have appeared before looking
+                        for new streams (See L</Idle Threshold>)
+  --limit, -L           max number of log streams to display
+  --localstack, -l      use LocalStack, short for -u http://localhost:4566
+  --no-group-name, -G   exclude group name in output
+  --no-stream-name, -S  exclude stream name in output
+  --profile, -p         AWS profile (default: \$AWS_PROFILE)
+  --region, -r          AWS region (default: \$AWS_REGION)
+  --sleep-time          number of seconds to sleep after no events have been found 
+  --stream, -s          stream name
+  --start-time, -t      start time in past of log events to display (See L</Start Time Formats>)
+
+=head2 Start Time Formats
+
+The C<--start-time> option accepts values in the format C<{n}d>,
+C<{n}h>, or C<{n}m> to specify a number of days, hours, or minutes
+in the past.
+
+If L<Date::Manip> is installed, a much broader set of natural language
+formats is supported, for example:
+
+ '2 days ago'
+ 'yesterday'
+ 'a week ago'
+ 'last Tuesday'
+ '2026-04-08 10:00'
+
+=head2 Idle Threshold
+
+When C<--follow> is enabled and no events have been found the
+script will sleep for the number of seconds defined by
+C<--sleep-time> (default 1s). If the script has slept for the idle
+threshold count (default: 10) it will attempt to find new log streams.
+
+=head1 SEE ALSO
+
+L<Amazon::API::CloudWatchLogs>, L<Amazon::Credentials>, L<Amazon::API>
+
+=head1 AUTHOR
+
+Rob Lauer - <rlauer@treasurersbriefcase.com>
+
+=head1 LICENSE
+
+This library is free software; you can redistribute it and/or modify it
+under the same terms as Perl itself.
+
+=cut

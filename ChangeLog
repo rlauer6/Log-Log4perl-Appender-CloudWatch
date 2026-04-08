@@ -1,0 +1,21 @@
+Wed Apr  8 12:27:47 2026  Rob Lauer  <rclauer@gmail.com>
+
+	[BigBang]:
+	* release-notes-1.0.0.md: new
+	* .gitignore: new
+	* ChangeLog: new
+	* Makefile: new
+	* README.md: new
+	* VERSION: new
+	* bin/aws-logs: new
+	* buildspec.yml: new
+	* lib/Amazon/CloudWatchLogs.pm.in: new
+	* lib/CloudWatchLogs.pm.in: new
+	* lib/Log/Log4perl/Appender/CloudWatch.pm.in: new
+	* release-notes-1.0.0.md: new
+	* release-notes.mk: new
+	* requires: new
+	* t/00-cloudwatchlogs.t: new
+	* t/00-log-log4perl-appender-cloudwatch.t: new
+	* test-requires: new
+	* version.mk: new
