@@ -1,3 +1,36 @@
+Thu May  7 08:28:14 2026  Rob Lauer  <rclauer@gmail.com>
+
+	[1.0.1]:
+	* VERSION: bump
+	* release-notes.md: new
+	* release-notes/release-notes-1.0.1.md: new
+	* lib/Amazon/CloudWatchLogs.pm.in
+	(cmd_get_stream)
+	- startFromHead true to position cursor at first stream
+	- preserve order of streams
+	- binmode STDOUT, ':utf8' to avoid wide character warning
+	(fetch_streams)
+	- return ordered hash
+	(cmd_version): new
+	(init): version
+	* bin/aws-logs.in: modulino
+	* release-notes/release-notes-1.0.0.md: moved
+	* README.md
+	- added TOC
+	* buildspec.yml
+	- '_' => '-'
+	(extra-files): release-notes.md
+	* .gitignore: updated from CPAN::Maker::Bootstrapper
+	* Makefile: likewise
+	* .includes/git.mk: new
+	* .includes/help.mk: new
+	* .includes/perl.mk: new
+	* .includes/release-notes.mk: moved
+	* .includes/update.mk: new
+	* .includes/upgrade.mk: new
+	* .includes/version.mk: moved
+	* cpanfile: new
+
 Wed Apr  8 12:27:47 2026  Rob Lauer  <rclauer@gmail.com>
 
 	[BigBang]:

@@ -1,3 +1,15 @@
+# Table of Contents
+
+* [NAME](#name)
+* [SYNOPSIS](#synopsis)
+* [DESCRIPTION](#description)
+* [DEPENDENCIES](#dependencies)
+* [CONFIGURATION](#configuration)
+  * [Options](#options)
+* [CAVEATS](#caveats)
+* [SEE ALSO](#see-also)
+* [AUTHOR](#author)
+* [LICENSE](#license)
 # NAME
 
 Log::Log4perl::Appender::CloudWatch - Appender to send logs to CloudWatch

@@ -2,7 +2,8 @@
 #-*- mode: sh; -*-
 # modulino invocation
 
+MODULINO_WRAPPER=aws-logs
 MODULE_NAME=Amazon::CloudWatchLogs
 MODULE_PATH=$(MODULE_PATH="${MODULE_NAME//:://}.pm" perl -M$MODULE_NAME -e 'print $INC{$ENV{MODULE_PATH}};')
 
-perl $MODULE_PATH "$@"
+MODULINO_WRAPPER=$MODULINO_WRAPPER perl $MODULE_PATH "$@"

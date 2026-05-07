@@ -9,3 +9,4 @@ Log::Log4perl::Appender 0
 Number::Bytes::Human 0.11
 Readonly 2.05
 Text::ASCIITable 0.22
+Tie::IxHash 1.23

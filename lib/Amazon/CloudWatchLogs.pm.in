@@ -16,6 +16,7 @@ use Text::ASCIITable;
 use Term::ANSIColor;
 use CLI::Simple::Constants qw(:chars :booleans);
 use Time::HiRes;
+use Tie::IxHash;
 
 use Readonly;
 
@@ -51,6 +52,16 @@ our $VERSION = '@PACKAGE_VERSION@';
 use parent qw(CLI::Simple);
 
 caller or __PACKAGE__->main;
+
+#########################################################################
+sub cmd_version {
+#########################################################################
+
+  print {*STDOUT} sprintf "%s v%s\n", $ENV{MODULINO_WRAPPER}, $VERSION;
+  print {*STDOUT} "Copyright (C) 2026, TBC Development Group, LLC. All rights reserved.\n";
+
+  return $SUCCESS;
+}
 
 #########################################################################
 sub cmd_delete_group {
@@ -217,7 +228,9 @@ sub cmd_get_stream {
 
   my $start_time = $self->get_start_time * $MILLISECONDS_PER_SECOND;
 
-  my %stream_tokens = map { $_ => $EMPTY } keys %{ $stream_list // {} };
+  # preserve order
+  my %stream_tokens;
+  tie %stream_tokens, 'Tie::IxHash', map { $_ => $EMPTY } keys %{ $stream_list // {} }; ## no critic (ProhibitTies)
 
   my $idle_count = 0;
 
@@ -225,21 +238,27 @@ sub cmd_get_stream {
     $SIG{INT} = sub { exit 1 };
   }
 
+  binmode STDOUT, ':utf8';
+
   FOLLOW: while ($TRUE) {
 
-    my $got_events = 0;
+    my $got_events = $FALSE;
 
     foreach my $stream_name ( keys %stream_tokens ) {
       my $rsp = $cwl->GetLogEvents(
         { logGroupName  => $group,
           logStreamName => $stream_name,
-          startTime     => $start_time,
-          $stream_tokens{$stream_name} ? ( nextToken => $stream_tokens{$stream_name} ) : (),
+          $stream_tokens{$stream_name}
+          ? ( nextToken => $stream_tokens{$stream_name} )
+          : (
+            startTime     => $start_time,
+            startFromHead => $JSON::PP::true,
+          ),
         }
       );
 
       if ( $rsp->{events} && @{ $rsp->{events} } ) {
-        $got_events = 1;
+        $got_events = $TRUE;
         $idle_count = 0;
 
         my ( $colored_group, $colored_stream ) = ( $group, $stream_name );
@@ -340,6 +359,9 @@ sub init {
 #########################################################################
   my ($self) = @_;
 
+  return $self->command('version')
+    if $self->get_version;
+
   # -- log message formatting
   if ( $self->get_localstack ) {
     $self->set_endpoint_url($LOCALSTACK_ENDPOINT);
@@ -365,6 +387,7 @@ sub init {
 
   return;
 }
+
 #########################################################################
 sub fmt_time {
 #########################################################################
@@ -450,16 +473,14 @@ sub fetch_streams {
       { logGroupName => $self->get_group,
         limit        => $limit // $ITER_LIMIT,
         orderBy      => 'LastEventTime',
-        descending   => JSON::PP::true,
         $next_token ? ( nextToken => $next_token ) : (),
       },
     );
 
+    # these are already in ascending order (oldest -> newest)
     my @log_streams = map { exists $_->{lastEventTimestamp} ? $_ : () } @{ $rsp->{logStreams} };
 
-    my @sorted_streams = reverse sort { $a->{lastIngestionTime} cmp $b->{lastIngestionTime} } @log_streams;
-
-    foreach my $s (@sorted_streams) {
+    foreach my $s (@log_streams) {
 
       my $stream_name = $s->{logStreamName};
       next if $logstream_prefix && $stream_name !~ /^\Q$logstream_prefix\E/ixsm;
@@ -476,9 +497,10 @@ sub fetch_streams {
     last if $limit && $limit <= @streams;
   }
 
-  my %log_streams = map { ( $_->{logStreamName}, $_ ) } @streams;
+  my %ordered_hash;
+  tie %ordered_hash, 'Tie::IxHash', map { ( $_->{logStreamName}, $_ ) } @streams; ## no critic (ProhibitTies)
 
-  return keys %log_streams ? \%log_streams : undef;
+  return @streams ? \%ordered_hash : undef;
 }
 
 #########################################################################
@@ -514,6 +536,7 @@ sub main {
     'last-stream'   => \&cmd_last_stream,
     'list-groups'   => \&cmd_list_groups,
     'list-streams'  => \&cmd_list_streams,
+    'version'       => \&cmd_version,
   );
 
   my @option_specs = qw(
@@ -535,6 +558,7 @@ sub main {
     sleep-time=i
     start-time|t=s
     stream|s=s
+    version|v
   );
 
   my %defaults = (
