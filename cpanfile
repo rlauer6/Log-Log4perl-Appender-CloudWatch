@@ -1,10 +1,11 @@
 requires "Amazon::API::CloudWatchLogs", "2.1.13";
-requires "CLI::Simple", "1.0.11";
-requires "CLI::Simple::Constants", "1.0.11";
+requires "CLI::Simple", "2.0.1";
+requires "CLI::Simple::Constants", "2.0.1";
+requires "CLI::Simple::Utils", "2.0.1";
 requires "Class::Accessor::Fast", "0.51";
 requires "Data::UUID", "1.227";
 requires "Date::Format", "2.24";
-requires "JSON::PP", "4.16";
+requires "JSON", "4.10";
 requires "Log::Log4perl::Appender", "0";
 requires "Number::Bytes::Human", "0.11";
 requires "Readonly", "2.05";

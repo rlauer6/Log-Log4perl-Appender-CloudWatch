@@ -1,3 +1,26 @@
+Tue Jun 16 13:02:13 2026  Rob Lauer  <rclauer@gmail.com>
+
+	[1.0.2]:
+	* VERSION: bump
+	* release-notes.md: new
+	* release-notes/release-notes-1.0.2.md: new
+	* requires: -JSON::PP, +JSON, CLI::Simple 2.0.1
+	* cpanfile: likewise
+	* lib/Amazon/CloudWatchLogs.pm.in
+	- use_log4perl
+	- pod updates
+	(cmd_list_groups)
+	- lazy load Text::ASCIITable, Number::Bytes::Human (no imports)
+	(cmd_get_stream)
+	- set decode_always to false to speed deserialization
+	- restore decode_always flag
+	(init)
+	- lazy load Term::ANSIColor
+	(fetch_streams)
+	- set decode_alway true, restore decode_always
+	- if no log streams >= start_time, use the whole list
+	(cmd_last_stream): use JSON, not ::PP
+
 Thu May  7 08:28:14 2026  Rob Lauer  <rclauer@gmail.com>
 
 	[1.0.1]:
@@ -5,11 +28,14 @@ Thu May  7 08:28:14 2026  Rob Lauer  <rclauer@gmail.com>
 	* release-notes.md: new
 	* release-notes/release-notes-1.0.1.md: new
 	* lib/Amazon/CloudWatchLogs.pm.in
+	- use JSON for faster deserialization
 	(cmd_get_stream)
 	- startFromHead true to position cursor at first stream
+	- turn off botocore shape deserialization
 	- preserve order of streams
 	- binmode STDOUT, ':utf8' to avoid wide character warning
 	(fetch_streams)
+	- filter stream list based on start data
 	- return ordered hash
 	(cmd_version): new
 	(init): version

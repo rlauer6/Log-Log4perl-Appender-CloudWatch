@@ -3,6 +3,11 @@ package Amazon::CloudWatchLogs;
 use strict;
 use warnings;
 
+BEGIN {
+  $ENV{PERL_JSON_BACKEND} = 'Cpanel::JSON::XS,JSON::XS,JSON::PP';
+  use JSON qw(decode_json encode_json);
+}
+
 use Amazon::API::CloudWatchLogs;
 use Carp;
 use Data::Dumper;
@@ -10,12 +15,9 @@ use Data::UUID;
 use Date::Format;
 use Digest::MD5 qw( md5_hex );
 use English qw( -no_match_vars );
-use JSON::PP;
-use Number::Bytes::Human qw( format_bytes );
-use Text::ASCIITable;
-use Term::ANSIColor;
 use CLI::Simple::Constants qw(:chars :booleans);
-use Time::HiRes;
+use CLI::Simple::Utils qw(choose);
+use Time::HiRes qw(gettimeofday tv_interval);
 use Tie::IxHash;
 
 use Readonly;
@@ -48,6 +50,8 @@ Readonly my $SECONDS_IN_HOUR         => $SECONDS_IN_MINUTE * $MINUTES_IN_HOUR;
 Readonly my $SECONDS_IN_DAY          => $SECONDS_IN_HOUR * $HOURS_IN_DAY;
 
 our $VERSION = '@PACKAGE_VERSION@';
+
+__PACKAGE__->use_log4perl( level => 'info' );
 
 use parent qw(CLI::Simple);
 
@@ -187,9 +191,13 @@ sub cmd_list_groups {
 
   my %log_groups = map { ( $_->{logGroupName}, $_ ) } @{$rsp};
 
+  require Text::ASCIITable;
+
+  require Number::Bytes::Human;
+
   my $t = Text::ASCIITable->new(
     { headingText => 'Log Groups',
-      allowANSI   => $TRUE,
+      allowANSI   => $self->get_color,
     },
   );
 
@@ -199,7 +207,7 @@ sub cmd_list_groups {
 
     my ( $bytes, $creation_time ) = @{ $log_groups{$g} }{qw(storedBytes creationTime)};
 
-    $bytes = $bytes ? format_bytes($bytes) : $EMPTY;
+    $bytes = $bytes ? Number::Bytes::Human::format_bytes($bytes) : $EMPTY;
 
     $t->addRow( $g, $bytes, fmt_time($creation_time) );
   }
@@ -238,13 +246,17 @@ sub cmd_get_stream {
     $SIG{INT} = sub { exit 1 };
   }
 
-  binmode STDOUT, ':utf8';
+  binmode STDOUT, ':encoding(UTF-8)';
+
+  my $decode_always = $cwl->get_decode_always;
+  $cwl->set_decode_always($FALSE);
 
   FOLLOW: while ($TRUE) {
 
     my $got_events = $FALSE;
 
     foreach my $stream_name ( keys %stream_tokens ) {
+
       my $rsp = $cwl->GetLogEvents(
         { logGroupName  => $group,
           logStreamName => $stream_name,
@@ -252,10 +264,14 @@ sub cmd_get_stream {
           ? ( nextToken => $stream_tokens{$stream_name} )
           : (
             startTime     => $start_time,
-            startFromHead => $JSON::PP::true,
+            startFromHead => \1,
           ),
         }
       );
+
+      if ($rsp) {
+        $rsp = decode_json($rsp) // {};
+      }
 
       if ( $rsp->{events} && @{ $rsp->{events} } ) {
         $got_events = $TRUE;
@@ -264,8 +280,8 @@ sub cmd_get_stream {
         my ( $colored_group, $colored_stream ) = ( $group, $stream_name );
 
         if ( my $color = $self->get_color ) {
-          $colored_group  = colored( $colored_group,  $GROUP_COLOR );
-          $colored_stream = colored( $colored_stream, $STREAM_COLOR );
+          $colored_group  = Term::ANSIColor::colored( $colored_group,  $GROUP_COLOR );
+          $colored_stream = Term::ANSIColor::colored( $colored_stream, $STREAM_COLOR );
         }
 
         my @prefix;
@@ -278,7 +294,15 @@ sub cmd_get_stream {
         my $message_prfx = join $SPACE, @prefix;
 
         foreach my $e ( @{ $rsp->{events} } ) {
-          my ( $message, $timestamp ) = @{$e}{qw( message timestamp )};
+          my ( $raw_message, $timestamp ) = @{$e}{qw( message timestamp )};
+
+          my $message = choose {
+            return $raw_message
+              if $decode_always;
+
+            return eval { decode_json($raw_message) } // $raw_message;
+          };
+
           chomp $message;
           printf "%s[%s] %s\n", $message_prfx, fmt_time($timestamp), $message;
         }
@@ -305,6 +329,8 @@ sub cmd_get_stream {
       }
     }
   }
+
+  $cwl->set_decode_always($decode_always);
 
   return $SUCCESS;
 }
@@ -385,6 +411,10 @@ sub init {
     )
   );
 
+  if ( $self->get_color ) {
+    require Term::ANSIColor;
+  }
+
   return;
 }
 
@@ -457,6 +487,9 @@ sub fetch_streams {
 
   my $cwl = $self->get_cwl;
 
+  my $decode_always = $cwl->get_decode_always;
+  $cwl->set_decode_always($TRUE);
+
   my @streams;
 
   my $next_token = $EMPTY;
@@ -469,6 +502,7 @@ sub fetch_streams {
   $cwl->set_use_paginator(0);
 
   LOOP: while ($TRUE) {
+
     my $rsp = $cwl->DescribeLogStreams(
       { logGroupName => $self->get_group,
         limit        => $limit // $ITER_LIMIT,
@@ -480,13 +514,17 @@ sub fetch_streams {
     # these are already in ascending order (oldest -> newest)
     my @log_streams = map { exists $_->{lastEventTimestamp} ? $_ : () } @{ $rsp->{logStreams} };
 
-    foreach my $s (@log_streams) {
+    # filter old streams before iterating
+    my @relevant = $start_time ? grep { $_->{lastIngestionTime} >= $start_time } @log_streams : @log_streams;
+
+    if ( !@relevant ) {
+      @relevant = @log_streams;
+    }
+
+    foreach my $s (@relevant) {
 
       my $stream_name = $s->{logStreamName};
       next if $logstream_prefix && $stream_name !~ /^\Q$logstream_prefix\E/ixsm;
-
-      last LOOP if $start_time && $s->{lastIngestionTime} < $start_time;
-
       push @streams, $s;
     }
 
@@ -496,6 +534,8 @@ sub fetch_streams {
 
     last if $limit && $limit <= @streams;
   }
+
+  $cwl->set_decode_always($decode_always);
 
   my %ordered_hash;
   tie %ordered_hash, 'Tie::IxHash', map { ( $_->{logStreamName}, $_ ) } @streams; ## no critic (ProhibitTies)
@@ -516,7 +556,7 @@ sub cmd_last_stream {
   my $last_stream = $self->fetch_streams();
 
   if ($last_stream) {
-    print JSON::PP->new->pretty->encode( values %{$last_stream} );
+    print JSON->new->pretty->encode( values %{$last_stream} );
   }
 
   $self->set_limit($limit);
@@ -602,66 +642,285 @@ C<Amazon::CloudWatchLogs> provides a command-line interface for common
 AWS CloudWatch Logs operations including listing log groups and streams,
 retrieving log events, and creating or deleting groups and streams.
 
+The module is implemented as a L<CLI::Simple> modulino and invoked via
+the C<aws-logs> script.
+
 =head1 USAGE
 
  aws-logs options command
 
 =head2 Commands
 
-  create-group    Create a new log group
-  create-stream   Create a new log stream
-  delete-group    Delete a log group
-  get-stream      Retrieves log stream events. Use with C<--follow> to tail streams continuously
-  last-stream     Displays name of last log stream with a given prefix
-  list-groups     List all log groups
-  list-streams    List all log streams for a group
-  help
+=over 5
+
+=item create-group
+
+Create a new CloudWatch log group.
+
+ aws-logs -g /my/log/group create-group
+
+=item create-stream
+
+Create a new log stream within a log group.
+
+ aws-logs -g /my/log/group -s my-stream create-stream
+
+=item delete-group
+
+Delete a log group and all of its log streams.
+
+ aws-logs -g /my/log/group delete-group
+
+=item get-stream
+
+Retrieve log events from all streams in a log group, ordered oldest
+stream first. Use C<--follow> to tail streams continuously and
+discover new streams as they are created.
+
+ aws-logs -g /aws/lambda/my-function -t '1 hour ago' get-stream
+ aws-logs -g /aws/lambda/my-function -t 30m --follow get-stream
+
+Streams are iterated in ascending C<LastEventTime> order so events
+are presented chronologically across multiple streams. The
+C<--start-time> option positions the cursor at the first event at
+or after the specified time - see L</Start Time Formats>.
+
+=item last-stream
+
+Display the metadata for the most recently active log stream in a
+log group, optionally filtered by a stream name prefix.
+
+ aws-logs -g /aws/lambda/my-function last-stream
+ aws-logs -g /aws/lambda/my-function -s '2026/05' last-stream
+
+Output is a JSON object containing the stream metadata including
+C<logStreamName>, C<firstEventTimestamp>, C<lastEventTimestamp>,
+and C<lastIngestionTime>.
+
+=item list-groups
+
+List all CloudWatch log groups in the current account and region.
+
+ aws-logs list-groups
+
+=item list-streams
+
+List all log streams for a log group.
+
+ aws-logs -g /aws/lambda/my-function list-streams
+ aws-logs -g /aws/lambda/my-function -L 5 list-streams
+
+=item help
+
+Display usage information.
+
+=back
 
 =head2 Options
 
-  --color, -c           display output in color (--no-color to disable)
-  --debug, -d           verbose debug output
-  --endpoint-url, -u    endpoint-url
-  --follow, -f          waits for new events and discovers new streams
-  --group, -g           log group name
-  --help, -h            help
-  --idle-threshold      number of times no events have appeared before looking
-                        for new streams (See L</Idle Threshold>)
-  --limit, -L           max number of log streams to display
-  --localstack, -l      use LocalStack, short for -u http://localhost:4566
-  --no-group-name, -G   exclude group name in output
-  --no-stream-name, -S  exclude stream name in output
-  --profile, -p         AWS profile (default: \$AWS_PROFILE)
-  --region, -r          AWS region (default: \$AWS_REGION)
-  --sleep-time          number of seconds to sleep after no events have been found 
-  --stream, -s          stream name
-  --start-time, -t      start time in past of log events to display (See L</Start Time Formats>)
+=over 5
+
+=item --color, -c
+
+Display output in color. Use C<--no-color> to disable. Colors are
+applied to the log group name (cyan) and stream name (green) in the
+output prefix.
+
+=item --debug, -d
+
+Enable verbose debug output including raw API requests and responses.
+Note that enabling debug mode with large log volumes will significantly
+impact performance due to L<Data::Dumper> output for every API call.
+
+=item --endpoint-url, -u
+
+Override the CloudWatch Logs endpoint URL. Useful for testing against
+LocalStack or other compatible endpoints.
+
+=item --follow, -f
+
+Continuously tail log streams, sleeping between polls and
+automatically discovering new streams as they are created. See
+L</Follow Mode> for details.
+
+=item --group, -g
+
+The CloudWatch log group name. Required for most commands.
+
+=item --help, -h
+
+Display usage information.
+
+=item --idle-threshold
+
+The number of sleep cycles with no events before the tool checks for
+new log streams. Default: C<10>. See L</Follow Mode>.
+
+=item --limit, -L
+
+Maximum number of log streams to retrieve. Default: C<50>.
+
+=item --localstack, -l
+
+Use LocalStack. Shorthand for C<--endpoint-url http://localhost:4566>.
+
+=item --no-group-name, -G
+
+Exclude the log group name from the output prefix.
+
+=item --no-stream-name, -S
+
+Exclude the log stream name from the output prefix.
+
+=item --profile, -p
+
+AWS credentials profile to use. Defaults to C<$AWS_PROFILE>.
+
+=item --region, -r
+
+AWS region. Defaults to C<$AWS_REGION>.
+
+=item --sleep-time
+
+Number of seconds to sleep between polls when no events are found.
+Default: C<1>. See L</Follow Mode>.
+
+=item --stream, -s
+
+Filter log streams by name prefix. Only streams whose names begin
+with this value are included.
+
+=item --start-time, -t
+
+Retrieve events starting from this point in the past. See
+L</Start Time Formats>.
+
+=back
 
 =head2 Start Time Formats
 
-The C<--start-time> option accepts values in the format C<{n}d>,
-C<{n}h>, or C<{n}m> to specify a number of days, hours, or minutes
-in the past.
+The C<--start-time> option accepts compact relative formats:
+
+ aws-logs -t 30m ...     # 30 minutes ago
+ aws-logs -t 2h ...      # 2 hours ago
+ aws-logs -t 7d ...      # 7 days ago
 
 If L<Date::Manip> is installed, a much broader set of natural language
-formats is supported, for example:
+formats is supported:
 
- '2 days ago'
- 'yesterday'
- 'a week ago'
- 'last Tuesday'
- '2026-04-08 10:00'
+ aws-logs -t 'yesterday' ...
+ aws-logs -t '2 days ago' ...
+ aws-logs -t 'last Tuesday' ...
+ aws-logs -t '2026-04-08 10:00' ...
 
-=head2 Idle Threshold
+B<Note:> C<--start-time> controls which events are returned but does
+not affect stream discovery. Streams whose C<lastIngestionTime> is
+older than C<--start-time> are excluded from iteration entirely.
 
-When C<--follow> is enabled and no events have been found the
-script will sleep for the number of seconds defined by
-C<--sleep-time> (default 1s). If the script has slept for the idle
-threshold count (default: 10) it will attempt to find new log streams.
+=head2 Follow Mode
+
+When C<--follow> is enabled, C<get-stream> continuously polls all
+matching log streams for new events. The polling cycle is:
+
+=over 5
+
+=item 1.
+
+Retrieve events from each stream using the forward pagination token
+from the previous call. Print any new events.
+
+=item 2.
+
+If no events were found, sleep for C<--sleep-time> seconds (default:
+1s) and increment the idle counter.
+
+=item 3.
+
+When the idle counter reaches C<--idle-threshold> (default: 10),
+call C<DescribeLogStreams> to discover any new streams that have been
+created since the last check, then reset the idle counter.
+
+=back
+
+With the default settings, new streams are discovered approximately
+every 10 seconds when no events are arriving.
+
+ # Tail a Lambda function log group, discovering new invocation streams
+ aws-logs -g /aws/lambda/my-function --follow get-stream
+
+=head1 PERFORMANCE
+
+=head2 JSON Backend
+
+C<GetLogEvents> responses can be large - a single page of events
+from an active Lambda function can exceed 2MB of JSON. Using
+L<JSON::PP> (pure Perl) to decode large payloads introduces
+significant latency. On a 2MB payload, L<JSON::PP> takes
+approximately 4 seconds while L<Cpanel::JSON::XS> or L<JSON::XS>
+takes under 0.1 seconds.
+
+C<Amazon::CloudWatchLogs> selects the fastest available JSON backend
+automatically:
+
+ BEGIN {
+   $ENV{PERL_JSON_BACKEND} = 'Cpanel::JSON::XS,JSON::XS,JSON::PP';
+   use JSON qw(decode_json encode_json);
+ }
+
+Installing L<Cpanel::JSON::XS> is B<strongly recommended>:
+
+ cpanm Cpanel::JSON::XS
+
+=head2 Shape Deserialization
+
+C<get-stream> bypasses L<Amazon::API>'s Botocore shape deserialization
+for C<GetLogEvents> responses by using the C<decode_always> flag. Shape
+deserialization constructs typed Perl objects for every field of every
+event - for a response containing thousands of events this adds
+substantial overhead with no benefit, since C<get-stream> only accesses
+the C<message> and C<timestamp> fields of each event.
+
+The raw JSON response is decoded directly into a plain hashref instead,
+which combined with the XS JSON backend reduces per-page retrieval from
+approximately 8 seconds to under 0.5 seconds.
+
+=head2 Benchmarks
+
+The following timings are representative for a single Lambda log stream
+with approximately 9,500 events:
+
+Metric                        aws-logs    AWS CLI
+Per page (GetLogEvents)       ~0.42s      ~0.40s
+Total (all pages, all setup)  ~3.5s       ~2.8s (single stream, no discovery)
+
+=head1 DEPENDENCIES
+
+=head2 Required
+
+L<Amazon::API::CloudWatchLogs>, L<Amazon::Credentials>, L<Amazon::API>,
+L<CLI::Simple>, L<JSON>, L<Tie::IxHash>, L<Readonly>
+
+=head2 Optional but Recommended
+
+=over 5
+
+=item L<Cpanel::JSON::XS> or L<JSON::XS>
+
+Dramatically faster JSON decoding for large payloads. Without one of
+these, L<JSON::PP> is used and performance on large log volumes will be
+significantly degraded. See L</Performance>.
+
+=item L<Date::Manip>
+
+Natural language time parsing for C<--start-time>. Without it, only
+the compact C<{n}d>, C<{n}h>, and C<{n}m> formats are supported.
+
+=back
 
 =head1 SEE ALSO
 
-L<Amazon::API::CloudWatchLogs>, L<Amazon::Credentials>, L<Amazon::API>
+L<Amazon::API::CloudWatchLogs>, L<Amazon::Credentials>, L<Amazon::API>,
+L<CLI::Simple>, L<Cpanel::JSON::XS>
 
 =head1 AUTHOR
 
