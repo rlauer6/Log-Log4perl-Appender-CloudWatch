@@ -1,3 +1,16 @@
+Tue Jun 30 13:27:12 2026  Rob Lauer  <rclauer@gmail.com>
+
+	[1.0.3]:
+	* VERSION: bump
+	* lib/Amazon/CloudWatchLogs.pm.in
+	(cmd_get_stream)
+	- track previous token per stream to detect drain
+	(fetch_streams)
+	- fetch streams newest to oldest
+	- stop accumulating streams if stream outside window
+	* release-notes.md: new
+	* release-notes/release-notes-1.0.3.md: new
+
 Tue Jun 16 13:02:13 2026  Rob Lauer  <rclauer@gmail.com>
 
 	[1.0.2]:

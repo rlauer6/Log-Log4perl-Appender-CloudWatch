@@ -49,7 +49,7 @@ Readonly my $HOURS_IN_DAY            => 24;
 Readonly my $SECONDS_IN_HOUR         => $SECONDS_IN_MINUTE * $MINUTES_IN_HOUR;
 Readonly my $SECONDS_IN_DAY          => $SECONDS_IN_HOUR * $HOURS_IN_DAY;
 
-our $VERSION = '@PACKAGE_VERSION@';
+our $VERSION = '1.0.3';
 
 __PACKAGE__->use_log4perl( level => 'info' );
 
@@ -241,6 +241,7 @@ sub cmd_get_stream {
   tie %stream_tokens, 'Tie::IxHash', map { $_ => $EMPTY } keys %{ $stream_list // {} }; ## no critic (ProhibitTies)
 
   my $idle_count = 0;
+  my %prev_tokens;  # track previous token per stream to detect drain
 
   if ( $self->get_follow ) {
     $SIG{INT} = sub { exit 1 };
@@ -254,6 +255,7 @@ sub cmd_get_stream {
   FOLLOW: while ($TRUE) {
 
     my $got_events = $FALSE;
+    my @pass_events;  # accumulate all events this pass for sorted output
 
     foreach my $stream_name ( keys %stream_tokens ) {
 
@@ -272,6 +274,8 @@ sub cmd_get_stream {
       if ($rsp) {
         $rsp = decode_json($rsp) // {};
       }
+
+      my $new_token = $rsp->{nextForwardToken};
 
       if ( $rsp->{events} && @{ $rsp->{events} } ) {
         $got_events = $TRUE;
@@ -293,22 +297,39 @@ sub cmd_get_stream {
 
         my $message_prfx = join $SPACE, @prefix;
 
-        foreach my $e ( @{ $rsp->{events} } ) {
-          my ( $raw_message, $timestamp ) = @{$e}{qw( message timestamp )};
-
-          my $message = choose {
-            return $raw_message
-              if $decode_always;
-
-            return eval { decode_json($raw_message) } // $raw_message;
-          };
-
-          chomp $message;
-          printf "%s[%s] %s\n", $message_prfx, fmt_time($timestamp), $message;
+        for my $e ( @{ $rsp->{events} } ) {
+          push @pass_events,
+            {
+            timestamp => $e->{timestamp},
+            message   => $e->{message},
+            prefix    => $message_prfx,
+            };
         }
       }
+      elsif ( !$self->get_follow
+        && defined $prev_tokens{$stream_name}
+        && defined $new_token
+        && $new_token eq $prev_tokens{$stream_name} ) {
+        # token has stabilized with no events — stream is drained
+        delete $stream_tokens{$stream_name};
+        next;
+      }
 
-      $stream_tokens{$stream_name} = $rsp->{nextForwardToken};
+      $prev_tokens{$stream_name}   = $stream_tokens{$stream_name};
+      $stream_tokens{$stream_name} = $new_token;
+    }
+
+    # print all events for this pass sorted by timestamp (oldest first)
+    for my $e ( sort { $a->{timestamp} <=> $b->{timestamp} } @pass_events ) {
+      my $message = choose {
+        return $e->{message}
+          if $decode_always;
+
+        return eval { decode_json( $e->{message} ) } // $e->{message};
+      };
+
+      chomp $message;
+      printf "%s[%s] %s\n", $e->{prefix}, fmt_time( $e->{timestamp} ), $message;
     }
 
     last if !$self->get_follow && !$got_events;
@@ -507,19 +528,21 @@ sub fetch_streams {
       { logGroupName => $self->get_group,
         limit        => $limit // $ITER_LIMIT,
         orderBy      => 'LastEventTime',
+        descending   => \1,
         $next_token ? ( nextToken => $next_token ) : (),
       },
     );
 
-    # these are already in ascending order (oldest -> newest)
+    # these are returned newest-active-first (descending => 1 above)
     my @log_streams = map { exists $_->{lastEventTimestamp} ? $_ : () } @{ $rsp->{logStreams} };
 
-    # filter old streams before iterating
+    # filter out streams older than the requested start_time
     my @relevant = $start_time ? grep { $_->{lastIngestionTime} >= $start_time } @log_streams : @log_streams;
 
-    if ( !@relevant ) {
-      @relevant = @log_streams;
-    }
+    # in descending order, once a page yields nothing relevant we've
+    # paged past the requested window - stop, don't fall back to
+    # including the (irrelevant, older) streams on this page
+    last LOOP if $start_time && @log_streams && !@relevant;
 
     foreach my $s (@relevant) {
 
