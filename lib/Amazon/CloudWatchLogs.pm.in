@@ -467,7 +467,12 @@ sub parse_start_time {
 #########################################################################
   my ($start_time) = @_;
 
-  eval { require Date::Manip; };
+  return _parse_start_time($start_time)
+    if $start_time =~ /\A\d+[dhm]\z/xsmi;
+
+  $start_time =~ s/(\d+)\s*(?:m|min)\s+/$1 min /xsm;
+
+  eval { require Date::Manip };
 
   return _parse_start_time($start_time)
     if $EVAL_ERROR;

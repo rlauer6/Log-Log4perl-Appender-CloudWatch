@@ -1,3 +1,14 @@
+Thu Jul  2 06:25:30 2026  Rob Lauer  <rclauer@gmail.com>
+
+	[1.0.4]:
+	* ChangeLog: modified
+	* VERSION: bump
+	* release-notes.md: new
+	* release-notes/release-notes-1.0.3.md: new
+	* lib/Amazon/CloudWatchLogs.pm.in
+	(parse_start_time)
+	- convert 1m, 1 m => min (more natural)
+
 Tue Jun 30 13:27:12 2026  Rob Lauer  <rclauer@gmail.com>
 
 	[1.0.3]:
