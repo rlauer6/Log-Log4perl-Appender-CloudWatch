@@ -20,3 +20,8 @@ resources
 **/*.crit
 **/*.tdy
 bin/aws-logs
+**/*.checked
+**/*.raw
+buildspec.yml.current
+extra-files.mk
+local/**

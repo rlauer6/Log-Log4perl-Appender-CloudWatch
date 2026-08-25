@@ -39,12 +39,8 @@ when the buffer is full or when the appender is destroyed.
 
 # DEPENDENCIES
 
-    Amazon::API
-    Amazon::Credentials
-    Data::UUID
-    Digest::MD5
-
-...and possibly others
+`Amazon::API::CloudWatchLogs`, [Class::Accessor::Fast](https://metacpan.org/pod/Class%3A%3AAccessor%3A%3AFast),
+[Data::UUID](https://metacpan.org/pod/Data%3A%3AUUID), [Log::Log4perl::Appender](https://metacpan.org/pod/Log%3A%3ALog4perl%3A%3AAppender)
 
 # CONFIGURATION
 
@@ -122,6 +118,9 @@ Example Log::Log4perl configuration:
     CloudWatch. The maximum number of events that can sent in one payload
     is 10K. The maximum size of the payload is 1,048,576 bytes.
 
+    _Note: `flush_buffer()` now automatically partitions a larger
+    retained buffer into legal batches._
+
     default: 1000
 
     See
@@ -158,7 +157,11 @@ Log::Log4perl configuration.
 
 # SEE ALSO
 
-[Amazon::API::CloudWatchLogs](https://metacpan.org/pod/Amazon%3A%3AAPI%3A%3ACloudWatchLogs), [Amazon::Credentials](https://metacpan.org/pod/Amazon%3A%3ACredentials), [Amazon::API](https://metacpan.org/pod/Amazon%3A%3AAPI)
+`Amazon::API::CloudWatchLogs` is an Amazon AWS service implemented by `Amazon::API`.
+
+For help with `Amazon::API` service classe see [Amazon::API:Help](https://metacpan.org/pod/Amazon%3A%3AAPI%3AHelp)
+
+[Amazon::API](https://metacpan.org/pod/Amazon%3A%3AAPI), [Amazon::Credentials](https://metacpan.org/pod/Amazon%3A%3ACredentials), [Amazon::API::Help](https://metacpan.org/pod/Amazon%3A%3AAPI%3A%3AHelp)
 
 # AUTHOR
 

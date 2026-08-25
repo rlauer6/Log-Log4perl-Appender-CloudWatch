@@ -8,22 +8,27 @@ use strict;
 use Amazon::API::CloudWatchLogs;
 use Carp;
 use Data::Dumper;
+use Encode qw(encode_utf8);
 use English qw(-no_match_vars);
 use Digest::MD5 qw(md5_hex);
 use Data::UUID;
 use Scalar::Util qw( reftype );
 
 use constant { ## no critic (ValuesAndExpressions::ProhibitConstantPragma)
-  BUFFER_SIZE             => 1_000,
-  MAX_RETRIES             => 5,
-  RETRY_DELAY             => 1,
-  SLASH                   => q{/},
-  EMPTY                   => q{},
-  TRUE                    => 1,
-  FALSE                   => 0,
-  MILLISECONDS_PER_SECOND => 1_000,
-  HTTP_OK                 => 200,
-  HTTP_BAD_REQUEST        => 400,
+  BUFFER_SIZE                 => 1_000,
+  MAX_BATCH_BYTES             => 1_048_576,
+  MAX_BATCH_EVENTS            => 10_000,
+  LOG_EVENT_OVERHEAD_BYTES    => 26,
+  MAX_BATCH_SPAN_MILLISECONDS => 24 * 60 * 60 * 1_000,
+  MAX_RETRIES                 => 5,
+  RETRY_DELAY                 => 1,
+  SLASH                       => q{/},
+  EMPTY                       => q{},
+  TRUE                        => 1,
+  FALSE                       => 0,
+  MILLISECONDS_PER_SECOND     => 1_000,
+  HTTP_OK                     => 200,
+  HTTP_BAD_REQUEST            => 400,
 };
 
 our $VERSION = '@PACKAGE_VERSION@';
@@ -66,11 +71,20 @@ sub new {
   croak 'no stream [' . $self->get_stream . '] exists.'
     if !$self->check_stream;
 
-  $self->set_buffer_size( $self->get_buffer_size || BUFFER_SIZE );
+  $self->set_buffer_size( $self->get_buffer_size // BUFFER_SIZE );
 
-  $self->set_max_retries( $self->get_max_retries || MAX_RETRIES );
+  $self->set_max_retries( $self->get_max_retries // MAX_RETRIES );
 
-  $self->set_retry_delay( $self->get_retry_delay || RETRY_DELAY );
+  $self->set_retry_delay( $self->get_retry_delay // RETRY_DELAY );
+
+  croak "ERROR: buffer size must be > 0"
+    if $self->get_buffer_size <= 0;
+
+  croak "ERROR: max retries must be > 0"
+    if $self->get_max_retries <= 0;
+
+  croak "ERROR: retry delay must be >= 0"
+    if $self->get_retry_delay <= 0;
 
   return $self;
 }
@@ -212,12 +226,9 @@ sub group_exists {
 ##################################################
   my ($self) = @_;
 
-  my $cwl   = $self->get_cwl;
-  my $group = $self->get_group;
+  my $group_description = $self->describe_group;
 
-  my $rsp = $cwl->DescribeLogGroups( { logGroupNamePrefix => $group } );
-
-  return @{ $rsp->{logGroups} } ? TRUE : FALSE;
+  return keys %{$group_description} ? TRUE : FALSE;
 }
 
 ##################################################
@@ -251,16 +262,9 @@ sub stream_exists {
 ##################################################
   my ($self) = @_;
 
-  my $group  = $self->get_group;
-  my $stream = $self->get_stream;
+  my $stream_description = $self->describe_stream;
 
-  my $rsp = $self->get_cwl->DescribeLogStreams(
-    { logGroupName        => $group,
-      logStreamNamePrefix => $stream,
-    },
-  );
-
-  return @{ $rsp->{logStreams} } ? TRUE : FALSE;
+  return keys %{$stream_description} ? TRUE : FALSE;
 }
 
 ##################################################
@@ -330,29 +334,133 @@ sub flush_buffer {
     $cwl->get_credentials->refresh_token;
   }
 
-  my $retries = $self->get_max_retries;
+  my $flushed_count = 0;
 
-  while ( $retries-- ) {
-    my $rsp = eval { $cwl->PutLogEvents( { logEvents => $events, logGroupName => $group, logStreamName => $stream, }, ); };
+  BATCH: while ( @{$events} ) {
 
-    last if !$EVAL_ERROR;
+    #
+    # An event that cannot fit by itself can never be sent.  Remove it
+    # so it does not permanently block everything behind it.
+    #
+    my $first_event_bytes = event_size( $events->[0] );
 
-    if ( ref($EVAL_ERROR) =~ /Amazon::API::Error/xsm ) {
-      my $error_rsp = $EVAL_ERROR->get_response;
+    if ( $first_event_bytes > MAX_BATCH_BYTES ) {
+      warn sprintf "CloudWatch log event exceeds maximum batch size (%d bytes); dropping event\n", $first_event_bytes;
+
+      shift @{$events};
+
+      $self->set_event_count( $self->get_event_count - 1 );
+
+      next BATCH;
+    }
+
+    #
+    # Build the next legal PutLogEvents batch from the front of the
+    # retained buffer.
+    #
+    my @batch;
+    my $batch_bytes     = 0;
+    my $first_timestamp = $events->[0]->{timestamp};
+
+    foreach my $event ( @{$events} ) {
+
+      last
+        if @batch >= MAX_BATCH_EVENTS;
+
+      my $event_bytes = event_size($event);
+
+      last
+        if $batch_bytes + $event_bytes > MAX_BATCH_BYTES;
+
+      last
+        if $event->{timestamp} - $first_timestamp > MAX_BATCH_SPAN_MILLISECONDS;
+
+      push @batch, $event;
+      $batch_bytes += $event_bytes;
+    }
+
+    #
+    # Retry this batch without changing the retained buffer.  Nothing
+    # is removed until PutLogEvents has completed successfully.
+    #
+    my $attempt = 0;
+    my $sent    = FALSE;
+
+    while ( $attempt < $self->get_max_retries ) {
+      $attempt++;
+
+      my $rsp;
+
+      eval { $rsp = $cwl->PutLogEvents( { logEvents => \@batch, logGroupName => $group, logStreamName => $stream, }, ); };
+
+      if ( !$EVAL_ERROR ) {
+
+        if ( my $rejected = $rsp->{rejectedLogEventsInfo} ) {
+
+          if ( defined $rejected->{tooOldLogEventEndIndex} ) {
+            warn sprintf "CloudWatch rejected log events that are too old (end index %d)\n",
+              $rejected->{tooOldLogEventEndIndex};
+          }
+
+          if ( defined $rejected->{expiredLogEventEndIndex} ) {
+            warn sprintf "CloudWatch rejected expired log events (end index %d)\n", $rejected->{expiredLogEventEndIndex};
+          }
+
+          if ( defined $rejected->{tooNewLogEventStartIndex} ) {
+            warn sprintf "CloudWatch rejected log events that are too new (start index %d)\n",
+              $rejected->{tooNewLogEventStartIndex};
+          }
+        }
+
+        $sent = TRUE;
+        last;
+      }
+
+      my $error = $EVAL_ERROR;
+
+      if ( ref($error) !~ /Amazon::API::Error/xsm ) {
+        croak $error;
+      }
+
       warn $cwl->print_error;
-    }
-    else {
-      croak $EVAL_ERROR;
+
+      if ( $attempt < $self->get_max_retries ) {
+        sleep $self->get_retry_delay;
+      }
     }
 
-    sleep $self->get_retry_delay;
+    #
+    # Leave this batch and everything behind it in the buffer so a
+    # subsequent flush can try again.
+    #
+    if ( !$sent ) {
+      warn sprintf "failed to flush %d CloudWatch log events after %d attempts\n", scalar @batch, $self->get_max_retries;
+
+      return $flushed_count;
+    }
+
+    #
+    # Remove only the batch that CloudWatch accepted.
+    #
+    my $batch_count = scalar @batch;
+
+    splice @{$events}, 0, $batch_count;
+
+    $self->set_event_count( $self->get_event_count - $batch_count );
+
+    $flushed_count += $batch_count;
   }
 
-  $self->init_buffer;
-
-  return $event_count;
+  return $flushed_count;
 }
 
+##################################################
+sub event_size {
+##################################################
+  my ($event) = @_;
+
+  return length( encode_utf8( $event->{message} ) ) + LOG_EVENT_OVERHEAD_BYTES;
+}
 ##################################################
 sub DESTROY {
 ##################################################
@@ -396,12 +504,8 @@ when the buffer is full or when the appender is destroyed.
 
 =head1 DEPENDENCIES
 
- Amazon::API
- Amazon::Credentials
- Data::UUID
- Digest::MD5
-
-...and possibly others
+C<Amazon::API::CloudWatchLogs>, L<Class::Accessor::Fast>,
+L<Data::UUID>, L<Log::Log4perl::Appender>
 
 =head1 CONFIGURATION
 
@@ -493,6 +597,9 @@ The number of events to buffer before sending the events to
 CloudWatch. The maximum number of events that can sent in one payload
 is 10K. The maximum size of the payload is 1,048,576 bytes.
 
+I<Note: C<flush_buffer()> now automatically partitions a larger
+retained buffer into legal batches.>
+
 default: 1000
 
 See
@@ -531,7 +638,11 @@ Log::Log4perl configuration.
 
 =head1 SEE ALSO
 
-L<Amazon::API::CloudWatchLogs>, L<Amazon::Credentials>, L<Amazon::API>
+C<Amazon::API::CloudWatchLogs> is an Amazon AWS service implemented by C<Amazon::API>.
+
+For help with C<Amazon::API> service classe see L<Amazon::API:Help>
+
+L<Amazon::API>, L<Amazon::Credentials>, L<Amazon::API::Help>
 
 =head1 AUTHOR
 

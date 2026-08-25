@@ -11,3 +11,4 @@ requires "Number::Bytes::Human", "0.11";
 requires "Readonly", "2.05";
 requires "Text::ASCIITable", "0.22";
 requires "Tie::IxHash", "1.23";
+recommends "Date::Manip", "6.98";
