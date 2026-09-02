@@ -29,9 +29,9 @@ Readonly my $HTTP_OK          => 200;
 # defaults & magic values
 Readonly my $GROUP_COLOR         => q{green};
 Readonly my $STREAM_COLOR        => q{magenta};
-Readonly my $DISCOVERY_INTERVAL  => 10;
+Readonly my $DISCOVERY_INTERVAL  => 1;
 Readonly my $ISO_8601_FORMAT     => q{%Y-%m-%dT%H:%M:%SZ};
-Readonly my $ITER_LIMIT          => 50;
+Readonly my $ITER_LIMIT          => 5;
 Readonly my $LOCALSTACK_ENDPOINT => q{http://localhost:4566};
 Readonly my $LOG_DELAY           => 1;
 Readonly my $TIME_ZONE           => q{GMT};
@@ -43,6 +43,7 @@ Readonly my $MINUTES_IN_HOUR         => 60;
 Readonly my $HOURS_IN_DAY            => 24;
 Readonly my $SECONDS_IN_HOUR         => $SECONDS_IN_MINUTE * $MINUTES_IN_HOUR;
 Readonly my $SECONDS_IN_DAY          => $SECONDS_IN_HOUR * $HOURS_IN_DAY;
+Readonly my $LAMBDA_IDLE_LIMIT       => 20 * $SECONDS_IN_MINUTE;
 
 our $VERSION   = '@PACKAGE_VERSION@';
 our $GIT_SHA   = '@GIT_SHA@';
@@ -234,7 +235,9 @@ sub cmd_get_stream {
   tie %stream_tokens, 'Tie::IxHash', map { $_ => $EMPTY } keys %{ $stream_list // {} }; ## no critic (ProhibitTies)
 
   my $last_discovery = Time::HiRes::time;
-  my %prev_tokens;  # track previous token per stream to detect drain
+  my %idle_streams;
+  my %idle_since;
+  my %retired_streams;
 
   if ( $self->get_follow ) {
     $SIG{INT} = sub { exit 1 };
@@ -247,10 +250,8 @@ sub cmd_get_stream {
 
   FOLLOW: while ($TRUE) {
 
-    if ( $self->get_follow
-      && Time::HiRes::time - $last_discovery >= $self->get_discovery_interval ) {
-
-      $self->refresh_streams( \%stream_tokens );
+    if ( $self->get_follow && Time::HiRes::time - $last_discovery >= $self->get_discovery_interval ) {
+      $self->refresh_streams( \%stream_tokens, \%idle_streams, \%idle_since, \%retired_streams );
       $last_discovery = Time::HiRes::time;
     }
 
@@ -259,17 +260,36 @@ sub cmd_get_stream {
 
     foreach my $stream_name ( keys %stream_tokens ) {
 
-      my $rsp = $cwl->GetLogEvents(
-        { logGroupName  => $group,
-          logStreamName => $stream_name,
-          $stream_tokens{$stream_name}
-          ? ( nextToken => $stream_tokens{$stream_name} )
-          : (
-            startTime     => $start_time,
-            startFromHead => \1,
-          ),
+      my $rsp;
+      my $attempt = 0;
+
+      GET_LOG_EVENTS:
+      while ($TRUE) {
+
+        $rsp = eval {
+
+          return $cwl->GetLogEvents(
+            { logGroupName  => $group,
+              logStreamName => $stream_name,
+              $stream_tokens{$stream_name}
+              ? ( nextToken => $stream_tokens{$stream_name} )
+              : (
+                startTime     => $start_time,
+                startFromHead => \1,
+              ),
+            }
+          );
+        };
+
+        if ( !$EVAL_ERROR ) {
+          last GET_LOG_EVENTS;
         }
-      );
+
+        die $EVAL_ERROR
+          if $EVAL_ERROR !~ /API\s+ERROR\(599\)/xsm || ++$attempt >= 3;
+
+        Time::HiRes::sleep( $self->get_sleep_time );
+      }
 
       if ($rsp) {
         $rsp = decode_json($rsp) // {};
@@ -279,6 +299,7 @@ sub cmd_get_stream {
 
       if ( $rsp->{events} && @{ $rsp->{events} } ) {
         $got_events = $TRUE;
+        delete $idle_since{$stream_name};
 
         my ( $colored_group, $colored_stream ) = ( $group, $stream_name );
 
@@ -305,16 +326,21 @@ sub cmd_get_stream {
             };
         }
       }
-      elsif ( !$self->get_follow
-        && defined $prev_tokens{$stream_name}
+      elsif ( defined $stream_tokens{$stream_name}
+        && $stream_tokens{$stream_name}
         && defined $new_token
-        && $new_token eq $prev_tokens{$stream_name} ) {
-        # token has stabilized with no events — stream is drained
+        && $new_token eq $stream_tokens{$stream_name} ) {
+        # token has stabilized with no events -- stream is idle
+
+        if ( $self->get_follow ) {
+          $idle_since{$stream_name} //= Time::HiRes::time;
+          $idle_streams{$stream_name} = { token => $new_token, };
+        }
+
         delete $stream_tokens{$stream_name};
         next;
       }
 
-      $prev_tokens{$stream_name}   = $stream_tokens{$stream_name};
       $stream_tokens{$stream_name} = $new_token;
     }
 
@@ -602,12 +628,47 @@ sub cmd_last_stream {
 #########################################################################
 sub refresh_streams {
 #########################################################################
-  my ( $self, $stream_tokens ) = @_;
+  my ( $self, $stream_tokens, $idle_streams, $idle_since, $retired_streams ) = @_;
 
-  my $stream_list = $self->fetch_streams;
+  my $stream_list     = $self->fetch_streams;
+  my $is_lambda_group = $self->get_group =~ m{\A/aws/lambda/}xsm;
+  my $now             = Time::HiRes::time;
 
+  # Give idle streams one poll at each discovery interval. Lambda streams
+  # that have remained idle beyond the grace period are retired instead.
+  foreach my $stream_name ( keys %{$idle_streams} ) {
+    next if exists $stream_tokens->{$stream_name};
+
+    my $idle_stream = $idle_streams->{$stream_name};
+
+    if ( $is_lambda_group
+      && exists $idle_since->{$stream_name}
+      && $now - $idle_since->{$stream_name} >= $LAMBDA_IDLE_LIMIT ) {
+
+      $retired_streams->{$stream_name} = { retired_at => $now * $MILLISECONDS_PER_SECOND, };
+
+      delete $idle_streams->{$stream_name};
+      delete $idle_since->{$stream_name};
+      next;
+    }
+
+    $stream_tokens->{$stream_name} = $idle_stream->{token};
+    delete $idle_streams->{$stream_name};
+  }
+
+  # Add newly discovered streams. A retired Lambda stream is only
+  # reactivated when DescribeLogStreams reports newer activity.
   foreach my $stream_name ( keys %{ $stream_list // {} } ) {
     next if exists $stream_tokens->{$stream_name};
+    next if exists $idle_streams->{$stream_name};
+
+    if ( my $retired_stream = $retired_streams->{$stream_name} ) {
+      my $last_event_timestamp = $stream_list->{$stream_name}->{lastEventTimestamp} // 0;
+      next if $last_event_timestamp <= $retired_stream->{retired_at};
+      delete $retired_streams->{$stream_name};
+      delete $idle_since->{$stream_name};
+    }
+
     $stream_tokens->{$stream_name} = $EMPTY;
   }
 
@@ -801,7 +862,7 @@ impact performance due to L<Data::Dumper> output for every API call.
 
 =item --discovery-interval
 
-Number of seconds between checks for newly created log streams when
+Number of seconds between stream discovery and idle-stream polling passes when
 C<--follow> is enabled. Default: C<10>. See L</Follow Mode>.
 
 =item --endpoint-url, -u
@@ -900,23 +961,55 @@ active streams may not be discovered immediately.
 
 =head2 Follow Mode
 
-When C<--follow> is enabled, C<get-stream> continuously polls all
-matching log streams for new events.
+When C<--follow> is enabled, C<get-stream> continuously polls matching log
+streams for new events.
 
-Each known stream is polled using the forward pagination token from
-the previous call. Events collected during a polling pass are sorted
-by timestamp before being displayed.
+Streams are maintained in three states:
 
-If no events are found during a polling pass, the tool sleeps for
-C<--sleep-time> seconds (default: 1) before polling again.
+=over 5
 
-Stream discovery runs independently of whether events are being
-received. Every C<--discovery-interval> seconds (default: 10),
-C<DescribeLogStreams> is called and any newly discovered matching
-streams are added to the set being followed.
+=item active
 
- # Tail a Lambda function log group, discovering new invocation streams
- aws-logs -g /aws/lambda/my-function --follow get-stream
+Active streams are polled on every pass using the forward pagination token
+from the previous C<GetLogEvents> call.
+
+=item idle
+
+When a stream returns no events and its forward token no longer advances, the
+stream is considered caught up and moved to the idle set. Idle streams are
+polled once per discovery interval rather than on every pass.
+
+If an idle stream produces new events, it becomes active again.
+
+=item retired
+
+For Lambda log groups, idle streams may eventually be retired from polling
+after remaining inactive beyond the configured retirement interval. Retired
+streams are not polled directly, but stream discovery can reactivate them if
+CloudWatch reports newer activity.
+
+=back
+
+This keeps active streams responsive while avoiding repeated C<GetLogEvents>
+calls against streams that are already caught up.
+
+Stream discovery runs independently of event polling. Every
+C<--discovery-interval> seconds, C<DescribeLogStreams> is called and newly
+discovered matching streams are added to the active set.
+
+The C<--start-time> option still controls which streams are initially
+considered relevant. For example:
+
+ aws-logs -g /aws/lambda/my-function -t 1h --follow get-stream
+
+will display events from Lambda streams active within the requested one-hour
+window, then continue following those streams while also discovering newly
+active streams.
+
+Because Lambda execution environments create distinct log streams and old
+streams can accumulate quickly, exhausted Lambda streams are eventually
+retired from direct polling. If a retired stream later becomes active again,
+periodic discovery can return it to the active set.
 
 =head1 PERFORMANCE
 
@@ -992,7 +1085,7 @@ the compact C<{n}d>, C<{n}h>, and C<{n}m> formats are supported.
 
 =head1 VERSION
 
-This documentation refers to version @PACKAGE_VERSION@
+This documentation refers to version 1.0.5
 
 =head1 SEE ALSO
 
